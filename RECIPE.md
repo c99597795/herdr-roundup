@@ -95,7 +95,7 @@ on macOS, and can be dragged between 44 and 480px). Top to bottom:
     after a failed Connect) at its lower right for a remote machine, name
     and state as tooltip; "New space there" is a `+` in an 18px box with a
     1px `dim` border.
-- **Agents** (Herdr's shipped `agents` list, the other half, at least 90px).
+- **Agents** (`roundup-agents`, Herdr's `agents` list, the other half, at least 90px).
 - **Footer** (69px, `border` line on top): "Settings" (a small `accent` dot
   when an app update is ready) and "Add machine" in `dim`, each with a 14px
   icon; on the rail only the icons, centred in 32px cells, label as
@@ -113,8 +113,12 @@ on macOS, and can be dragged between 44 and 480px). Top to bottom:
   icon, the pane's name (medium `foreground`), its id in a small mono chip
   (10.5px, `dim` on `hover`: a terminal's address such as `t5j`, or a mod
   pane's id shortened to `p` and 6 hex digits), the folder in `dim`, the
-  agent's status, and on hover rename, split right, split down, zoom and
-  close. Terminal padding 14 × 12px. Right-clicking a terminal shows Herdr's
+  agent's context meter and status; on hover rename, split right, split
+  down, zoom and close come in before the meter, so meter and status stay
+  put. The meter (Claude Code and Codex panes) is a pill: a bar, the
+  percent and the tokens (`4% 18.3k / 475k`), `accent` below 65%,
+  `working` from 65%, `blocked` with an alert mark from 80%; without a
+  known window only the tokens. Terminal padding 14 × 12px. Right-clicking a terminal shows Herdr's
   pane menu (Split right, Split down, Zoom, where right-clicks go, Close
   pane), then "Ask before closing a pane" with the same three choices. A
   terminal outside a tab has no pane: its menu leaves out Split, Zoom and
@@ -226,6 +230,19 @@ on macOS, and can be dragged between 44 and 480px). Top to bottom:
   Esc cancels); an empty name goes back to the program's. A click elsewhere
   focuses the pane. Tooltips: the whole id on the chip, the given and the
   program's name on the name.
+- **Context meter:** follows a working agent within about 15s (and 2s
+  after each status change), an idle one, or one in a tab not shown,
+  within a minute. Narrow headers drop the tokens, then the bar, then the
+  percent. Hovering it opens a card: the tokens, window and percent, free,
+  model, when and from where read, the last compaction and, for an idle
+  Claude Code session above 200k, the idle compaction it expects (about
+  55 min after the last answer, as observed). No meter for a shell, a mod
+  pane, an agent of another machine, or a source not proven.
+  - **Exact numbers need an integration** (`scripts/agent-integrations.sh
+    install|uninstall|status <claude|codex>`, only with the person's yes:
+    it edits their agent config, backs it up, restores it exactly).
+    Without it Claude Code shows its window only after a `/context`, Codex
+    only in direct mode (`codex --no-daemon`).
 - **Closing** asks first as its kind's choice says: the tab menu's for tabs,
   the terminal menu's for panes; both stay after a restart. A tab closes by
   its ×, its menu's Close or `cmd-w`; a pane by its header's ×, Close pane
@@ -385,7 +402,7 @@ on macOS, and can be dragged between 44 and 480px). Top to bottom:
   - `brand` block (px 46, `window_drag`): `roundup-workspace-chrome`
   - `sidebar-lists` column:
     - `spaces` block (weight 1, min 90): `roundup-spaces`
-    - `agents` block (weight 1, min 90): shipped `agents`
+    - `agents` block (weight 1, min 90): `roundup-agents`
   - `sidebar-footer` block (px 69): `roundup-workspace-chrome` with
     `props: { footer: true }`
 - `work` column (`resizable: false`):
@@ -464,6 +481,19 @@ Commands: `pane.focus`, `pane.split`, `pane.zoom`, `pane.close`,
 `rename.svg`, and the shipped header's `split-right`, `split-down`,
 `zoom`, `unzoom`, `close`.
 
+**Context meter** (in `roundup-pane`; sources and why in
+`docs/adr/0003-context-from-agent-integrations.md`, how in the files'
+comments): a `ContextReader` per header copy (`context/reader.js`), one
+strategy per agent program (`context/strategies/<agent>.js`), `io` from
+`context-io.js`, the pill and its `HoverCard` from `context-view.js`.
+- **Integrations:** `claude` sets `statusLine.command` to `exec sh
+  '<…>/mods/roundup-pane/integrations/claude-statusline.sh'` (the previous
+  command runs after it, kept in `~/.config/herdr-roundup/integrations/`);
+  `codex` adds `"thread-id"` last to `tui.terminal_title`.
+- **Adding an agent:** one strategy file and one line in the registry; an
+  integration writes `~/.cache/herdr-roundup/context/<agent>/<t>.json`
+  with `{v: 1, terminal, pid, at}`.
+
 **`roundup-spaces`** (clone of `spaces` 0.1.14, `place: "none"`, title
 "Spaces"). Reads `spaces()`, `panes()`, `terminals()` (each agent's `turn`),
 `agents()`, `machines()`, `theme()`, `settings().dark`, `window()?.active`
@@ -504,6 +534,10 @@ without the `<machine>/` prefix and reduces its `root` to the map:
 readable answer per machine, logs the first failure per machine once, and
 reads again for each new set of agents the tree doesn't hold. Programs'
 icons as in `agents`: `svg(icon)` when `tint`, else `image(icon)`.
+
+**`roundup-agents`** (clone of `agents` 0.1.15, `place: "none"`, title
+"Agents"): Herdr's agent list. Its one change: a title item that is only a
+Codex thread id (the context meter's integration) is no row's name.
 
 **`roundup-menu`** (clone of `menu` 0.1.14, `place: "none"`): Herdr's
 context menu. Its one change: `init` writes its overlay id to shared
@@ -605,7 +639,7 @@ written by `scripts/build-icons.mjs` (`docs/adr/0002-file-icon-set.md`);
 Herdr's `chevron-right`, `chevron-down`, `chevron-left`, `branch`,
 `search`.
 
-**Shipped mods used:** `agents`, `changes`, `workspace-status`, plus
+**Shipped mods used:** `changes`, `workspace-status`, plus
 `picker`, `menu` and `machine-add` as overlays.
 
 **Keys:** the `layout:Herdr-Roundup` section binds `cmd-w` to
@@ -698,6 +732,9 @@ of global `tab.close` and `pane.close`.
   or `roundup-pane`. Not covered: the command palette's `tab.close` and
   `pane.close`. `pane.close` has no `confirmed`, so a tab's only pane
   closes with `tab.close`.
+- **Claude Code's status line after `/compact`** reports zeros: the
+  transcript's `postTokens` stands until the next answer. Codex cuts its
+  title's thread id and writes it only after the first message.
 - **Mods can't import from each other:** `find()` and `narrow()` are copied
   into both chrome mods, `close.js` and `menu.js` from `roundup-tabs` into
   `roundup-pane`. `scripts/sync.sh` stops when those differ.
@@ -767,6 +804,9 @@ of global `tab.close` and `pane.close`.
   the menu with no card over it.
 - The sidebar toggle narrows to the rail (numbers and `●`/`·`) and widens
   back.
+- A Claude Code and a Codex pane with their integrations show their
+  numbers (`5% 47.9k / 1M`), split in one tab each its own; after
+  `/compact` the meter drops, after `/clear` it goes within a minute.
 - Every pane header shows its terminal's address (`t5j`); double-clicking
   copies it. `hc label t5j roundup-pane.name=Build` shows "Build" within a
   second; so does renaming in the dialog, and an empty name shows the

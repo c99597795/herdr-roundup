@@ -18,10 +18,24 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
-import { panes, terminals, props, run, theme, settings, home, hc, shared, setShared, openOverlay, closeOverlay, notify } from "herdr";
+import { panes, terminals, props, run, theme, settings, home, hc, shared, setShared, openOverlay, closeOverlay, notify, focused } from "herdr";
 import { closePane, givenName, fallbackName, NAME_LABEL, NAMES } from "./close.js";
 import { menuView, shortcut } from "./menu.js";
 import { folder, paneId, cutName } from "./header-text.js";
+// Roundup's own: the agent's context meter (context/, context-io.js, context-view.js; RECIPE "Context").
+import { ContextReader, sweep } from "./context/reader.js";
+import { headerTier } from "./context/text.js";
+import { makeIo } from "./context-io.js";
+import { meter } from "./context-view.js";
+
+// Integration files of ended terminals go once an hour, by whichever header gets there first.
+let lastSweep = 0;
+const SEE_MS = 2000;
+// A hover card draws above popups: the meter's stays empty while one of these holds an overlay id.
+// This mod's own menu and rename dialog write theirs to OVERLAY and clear only their own (as
+// roundup-menu does); roundup-menu's menus and the close confirmation (close.js) write theirs.
+const OVERLAY = "roundup-pane.overlay";
+const covered = () => Boolean(shared("roundup-menu.open") || shared("roundup-confirm.open") || shared(OVERLAY));
 
 function icon(p, size, color) {
   if (!p?.icon) return null;
@@ -65,6 +79,10 @@ export default class Pane extends View {
   init(_props, cx) {
     this.hovered = false;
     this.copied = false;
+    // The menu and the dialog are overlays: their id goes to OVERLAY until they close.
+    const overlay = (props()?.rename || props()?.target) && props()?.overlay;
+    this.overlay = overlay || null;
+    if (this.overlay) setShared(OVERLAY, this.overlay);
     if (props()?.rename) return this.initDialog(cx);
     // The terminal's right-click menu: props { tab: "pane", target: { pane, terminal }, overlay }.
     if (props()?.target) {
@@ -73,6 +91,24 @@ export default class Pane extends View {
       this.handle.focus();
       return;
     }
+    // init's cx outlives this call (an AsyncContext): its timer gives hc get a deadline.
+    this.context = new ContextReader(makeIo({ after: (ms, f) => cx.timer.after(ms, f) }));
+    this.width = null;
+    // A header in a hidden tab doesn't render, so render's see() misses the tab going and coming
+    // back, and status changes there: this look tells the reader (no I/O, only panes() and focused()).
+    cx.timer.every(SEE_MS, (cx) => { const p = this.me(); if (p) this.context.see(p, focused()?.tab === p.tab, cx); });
+    cx.timer.every(10 * 60_000, (cx) => {
+      if (Date.now() - lastSweep < 3_600_000) return;
+      lastSweep = Date.now();
+      cx.spawn(async () => { await sweep(makeIo(), terminals().map((t) => t.address)).catch(() => 0); });
+    });
+  }
+
+  // Only its own entry: a newer menu or dialog may have taken the key meanwhile. (One left by a
+  // crash goes with the next overlay, which writes its id and clears it on closing.)
+  async close() {
+    if (this.overlay && shared(OVERLAY) === this.overlay) setShared(OVERLAY, null);
+    this.context?.close();
   }
 
   me() {
@@ -125,11 +161,20 @@ export default class Pane extends View {
     const name = given || fallback;
     const id = paneId(p);
     const pic = icon(p.program, 14, t.dim);
+    const font = settings().font_family ?? "JetBrains Mono";
     const st = p.status;
     const pane = p.pane;
+    this.context?.see(p, focused()?.tab === p.tab, cx);
+    // The tier from the current zoom, so a zoom change re-tiers without a new measurement.
+    this.shownTier = headerTier(this.width, settings()?.zoom);
+    const ctx = this.context && meter(t, { pane, reading: this.context.reading, tier: this.shownTier, agent: this.context.strategy?.id, hint: this.context.hint, covered: covered(),
+      // An icon of its own: an element belongs to the one parent it's given (gpui-kit.d.ts).
+      head: { pic: icon(p.program, 14, t.dim), name, id: id.shown, font } });
     return h_flex()
       .id(`pane-head-${pane}`)
       .size_full()
+      // The width is kept on every change (a later zoom tiers it), but only a new tier re-renders.
+      .on_size_change((size, cx) => { this.width = size.width; if (headerTier(this.width, settings()?.zoom) !== this.shownTier) cx.notify(); })
       .px(10)
       .gap(8)
       .items_center()
@@ -159,7 +204,7 @@ export default class Pane extends View {
         .items_center()
         .rounded(4)
         .bg(this.copied ? t.accent + "26" : t.hover)
-        .font_family(settings().font_family ?? "JetBrains Mono")
+        .font_family(font)
         .text_size(10.5)
         .text_color(this.copied ? t.accent : t.dim)
         .hover((s) => s.text_color(t.foreground))
@@ -167,15 +212,18 @@ export default class Pane extends View {
         .on_click((e, cx) => { if (e.click_count === 2) { cx.stop_propagation(); this.copyId(cx, id); } })
         .child(this.copied ? "copied" : id.shown))
       .child(div().flex_1().truncate().text_color(t.dim).child(folder(p.cwd, home())))
-      .when(st === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
-      .when(st === "blocked", el => el.child(div().flex_none().px(6).h(18).flex().items_center().rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).child("Needs you")))
-      .when(st === "done", el => el.child(div().size(7).flex_none().rounded(4).bg(t.done)))
+      // Roundup: the hover buttons come before the meter and the status (Herdr: after the status),
+      // so those two stay where they are when the pointer enters the header.
       .when(this.hovered, el => el
         .child(this.button(t, `ph-n-${pane}`, "rename", "Rename", () => this.openRename(p, given, fallback)))
         .child(this.button(t, `ph-r-${pane}`, "split-right", "Split right", () => run("pane.split", { direction: "right", pane })))
         .child(this.button(t, `ph-d-${pane}`, "split-down", "Split down", () => run("pane.split", { direction: "down", pane })))
         .child(this.button(t, `ph-z-${pane}`, p.zoomed ? "unzoom" : "zoom", p.zoomed ? "Unzoom" : "Zoom", () => run("pane.zoom", { pane })))
-        .child(this.button(t, `ph-x-${pane}`, "close", "Close", () => closePane(pane))));
+        .child(this.button(t, `ph-x-${pane}`, "close", "Close", () => closePane(pane))))
+      .when(Boolean(ctx), (el) => el.child(ctx))
+      .when(st === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
+      .when(st === "blocked", el => el.child(div().flex_none().px(6).h(18).flex().items_center().rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).child("Needs you")))
+      .when(st === "done", el => el.child(div().size(7).flex_none().rounded(4).bg(t.done)));
   }
 
   // --- the rename dialog (this mod as an overlay), shaped like Herdr's `prompt` ---
