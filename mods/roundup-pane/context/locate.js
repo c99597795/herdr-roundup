@@ -12,6 +12,9 @@
 //   io.tail(path, bytes)          { text, whole } of the file's last bytes, or null
 //   io.head(path, bytes)          its first bytes as text, or null
 //   io.list(dir)                  the names in a folder, or null
+//   io.recentFiles(root, name, minutes)
+//                                 the files below root named like the find pattern, written within
+//                                 the last minutes, as [{ path, mtime }]: [] for none, null on failure
 //   io.openFiles(pid)             paths the process and its descendants hold open (`lsof`), or null
 //   io.screen(address)            the terminal's screen as text (`hc read <t> --json`), or null
 //   io.lastLinesWith(path, text, re, maxLength, n)
@@ -26,6 +29,28 @@
 
 // Where integrations write, one file per terminal: ~/.cache/herdr-roundup/context/<agent>/<t>.json.
 export const integrationFile = (io, agent, terminal) => `${io.home}/.cache/herdr-roundup/context/${agent}/${terminal}.json`;
+
+// A folder as one spelling: repeated slashes as one, none at the end ("/" stays "/"). An agent's
+// config folder names its account (limits/store.js): `/x/.claude/` and `/x/.claude` are one. A `~`
+// stays as written: the agent takes the variable as it is too.
+export const normalizeFolder = (p) => (typeof p === "string" ? p.replace(/\/{2,}/g, "/").replace(/(.)\/$/, "$1") : p);
+
+// How many of an account's kept files the strategies' accountLimits read at a time (eachLimited).
+export const ACCOUNT_AT_ONCE = 4;
+
+// `fn` over `items`, at most `limit` at a time; a failing one costs only its own result (null).
+export async function eachLimited(items, limit, fn) {
+  const out = new Array(items.length).fill(null);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      try { out[i] = await fn(items[i], i); } catch { out[i] = null; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
 
 export function parseJson(text) {
   if (typeof text !== "string" || !text) return null;
@@ -45,6 +70,17 @@ export async function foreground(io, terminal) {
   const t = await io.terminal(terminal);
   if (!t) return NO_ANSWER;
   return Number.isInteger(t.pid) && t.pid > 0 ? t : null;
+}
+
+// What a strategy's locate() left in the reader's `memo` about the process it took for the agent
+// (the plan limits' account, its config folder, its pid, whether its session runs on the plan) goes once
+// that process proves not to be it: no foreground process, another terminal's environment, another
+// pid by the end of the look. Not on NO_ANSWER: a failed `hc get` proves nothing.
+export function forgetProcess(memo) {
+  memo.account = null;
+  memo.home = null;
+  memo.pid = null;
+  memo.plan = null;
 }
 
 // The environment of the terminal's process (`ps -wwE`), which never changes while it runs: kept

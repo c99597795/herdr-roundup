@@ -109,6 +109,79 @@ test("the status line script keeps Claude's JSON per terminal with its pid, then
   assert.deepEqual(readdirSync(join(home, ".cache/herdr-roundup/context/claude")), ["t7.json"], "no temp file left");
 });
 
+test("the status line script stamps limitsAt when Claude's API time grew since its last run for the same process and session; a mode change keeps it, anything else leaves it unknown", () => {
+  const file = join(home, ".cache/herdr-roundup/context/claude/t7.json");
+  const stdin = (api, session = "s1") => JSON.stringify({ session_id: session, cost: { total_cost_usd: 1, total_api_duration_ms: api }, rate_limits: { five_hour: { used_percentage: 43, resets_at: 1794783000 } } });
+  const status = (input, pid = "4242") => {
+    const r = spawnSync("sh", [script], { input, env: { ...env, HC_TERMINAL_ID: "t7", CLAUDE_PID: pid }, encoding: "utf8" });
+    assert.equal(r.status, 0);
+    return json(file);
+  };
+  let k = status(stdin(100));
+  assert.deepEqual([k.api, k.session, k.limitsAt], [100, "s1", null], "first sight: nothing to compare with, so when the limits are from is unknown");
+  assert.equal(status(stdin(100)).limitsAt, null, "run again without an answer: still unknown");
+  k = status(stdin(250));
+  assert.ok(Math.abs(k.limitsAt - Date.now()) < 5000, "the API time grew: an answer, the limits are from now");
+  assert.equal(k.limitsAt, k.at);
+  assert.deepEqual(k.claude, JSON.parse(stdin(250)), "Claude's JSON as it came");
+  // A mode change an hour later: the same API time. The answer's time stays, the file's moves on.
+  writeFileSync(file, JSON.stringify({ ...k, at: k.at - 3_600_000, limitsAt: k.limitsAt - 3_600_000 }) + "\n");
+  const later = status(stdin(250));
+  assert.equal(later.limitsAt, k.limitsAt - 3_600_000);
+  assert.ok(later.at > later.limitsAt);
+  // Another session in the same process (/clear): unknown until its next answer.
+  assert.equal(status(stdin(300, "s2")).limitsAt, null);
+  assert.ok(status(stdin(400, "s2")).limitsAt > 0);
+  // Another process in the terminal, a counter that went down, a stdin without the counter.
+  assert.equal(status(stdin(500, "s2"), "999").limitsAt, null, "another process's file is no baseline");
+  assert.ok(status(stdin(600, "s2"), "999").limitsAt > 0);
+  assert.equal(status(stdin(10, "s2"), "999").limitsAt, null, "a smaller counter proves nothing");
+  k = status(JSON.stringify({ session_id: "s2" }), "999");
+  assert.deepEqual([k.api, k.limitsAt], [null, null]);
+  assert.equal(status(stdin(700, "s2"), "999").limitsAt, null, "after a run without the counter there is no baseline");
+  // A file of the script before limitsAt, and one that isn't the script's.
+  writeFileSync(file, JSON.stringify({ v: 1, terminal: "t7", pid: 999, at: 1, claude: { session_id: "s2" } }) + "\n");
+  assert.equal(status(stdin(800, "s2"), "999").limitsAt, null);
+  writeFileSync(file, "not json");
+  assert.equal(status(stdin(900, "s2"), "999").limitsAt, null);
+  // A session id that isn't one, and Claude's JSON spelled with spaces: unknown, and the file is whole.
+  k = status(JSON.stringify({ session_id: 'a"b', cost: { total_api_duration_ms: 5 } }), "999");
+  assert.deepEqual([k.session, k.limitsAt, k.claude.session_id], ["", null, 'a"b']);
+  k = status(JSON.stringify(JSON.parse(stdin(950, "s2")), null, 1), "999");
+  assert.deepEqual([k.api, k.limitsAt, k.claude.cost.total_api_duration_ms], [null, null, 950]);
+});
+
+test("a resumed Claude session (its old API time back, no limits yet) shows its account's limits until an answer in this process says otherwise", async () => {
+  const { contextIo } = await import("./support/context-io.mjs");
+  const { makeStore } = await import("../mods/roundup-pane/limits/store.js");
+  const claude = (await import("../mods/roundup-pane/context/strategies/claude.js")).default;
+  const file = join(home, ".cache/herdr-roundup/context/claude/t7.json");
+  const stdin = (api, limits = false) => JSON.stringify({ session_id: "s1", cost: { total_api_duration_ms: api }, ...(limits && { rate_limits: { five_hour: { used_percentage: 43, resets_at: 1794783000 } } }) });
+  const write = (input, pid) => assert.equal(spawnSync("sh", [script], { input, env: { ...env, HC_TERMINAL_ID: "t7", CLAUDE_PID: pid }, encoding: "utf8" }).status, 0);
+  // The script's real file, then the strategy's look at it, for the process 4242 in t7.
+  const io = contextIo({ home, terminals: { t7: { pid: 4242, created: 1000, title: "Claude Code", cwd: "/x" } }, envs: { 4242: { HC_TERMINAL_ID: "t7" } } });
+  io.files[`${home}/.claude/sessions/4242.json`] = JSON.stringify({ pid: 4242, sessionId: "s1", cwd: "/x", startedAt: 2000, kind: "interactive" });
+  io.limits = makeStore();
+  const look = async (memo) => { io.files[file] = readFileSync(file, "utf8"); await claude.locate({ terminal: "t7" }, io, memo); return memo; };
+  // The session ran before in another process of this terminal, then `claude --resume` (4242): its
+  // first status has the old API time back and no limits yet, also after a mode change.
+  write(stdin(3000, true), "1111");
+  write(stdin(4200), "4242");
+  const memo = await look({});
+  assert.equal(memo.plan, null, "the API time it got back is no answer here: the account's limits show");
+  write(stdin(4200), "4242");
+  assert.equal((await look(memo)).plan, null);
+  // Its first answer in this process, without limits: off the plan.
+  write(stdin(5100), "4242");
+  assert.deepEqual((await look(memo)).plan, { pid: 4242, key: "s1", on: false });
+  // A subscriber's resumed session: its first answer brings the limits, on the plan.
+  write(stdin(4200), "4242");
+  const sub = await look({});
+  assert.equal(sub.plan, null);
+  write(stdin(6000, true), "4242");
+  assert.deepEqual((await look(sub)).plan, { pid: 4242, key: "s1", on: true });
+});
+
 test("the status line script writes nothing outside a Herdr terminal or for an odd terminal id, and prints nothing without a previous line", () => {
   for (const id of [undefined, "../x", "t 7"]) {
     const e = { ...env };

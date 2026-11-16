@@ -17,7 +17,7 @@
 // - Module code is shared by the copies: one queue lets two reads run at once, not all panes'.
 
 import { STRATEGIES, strategyFor } from "./registry.js";
-import { NO_ANSWER, UNSURE } from "./locate.js";
+import { NO_ANSWER, UNSURE, forgetProcess } from "./locate.js";
 import { NO_READING } from "./tail.js";
 
 export const WORKING_MS = 15_000;
@@ -87,7 +87,9 @@ export function valid(r) {
 
 const sameStats = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length
   && a.every((s, i) => (s === null ? b[i] === null : b[i] !== null && s.size === b[i].size && s.mtime === b[i].mtime));
-const sourceKey = (s) => JSON.stringify([s.id, s.pid, s.session ?? s.thread ?? null, s.files]);
+// The account belongs to it: a strategy that offers limits in read() (Codex) whose account becomes
+// known on a later look (a failed `ps` before) reads again, though its file hasn't changed.
+const sourceKey = (s) => JSON.stringify([s.id, s.pid, s.session ?? s.thread ?? null, s.account ?? null, s.files]);
 // Spreads the first reads of many headers over a moment.
 const jitter = (terminal) => [...String(terminal)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 9973, 7) % 8 * 150;
 
@@ -98,6 +100,10 @@ export function idleHint(reading, status, now) {
   if (!Number.isFinite(at) || status === "working") return null;
   return now <= at + HINT_FOR_MS ? at : null;
 }
+
+// The strategy has said this pane's own session doesn't run on the plan (`memo.plan`, set by its
+// locate() or read()): it shows no limits and asks for none.
+const offPlan = (memo) => memo.plan?.on === false;
 
 export class ContextReader {
   constructor(io, { strategies = STRATEGIES, queue = sharedQueue } = {}) {
@@ -119,8 +125,15 @@ export class ContextReader {
     this.stats = null;
     this.memo = {};
     this.hint = null;
+    // The account the agent runs on (limits/store.js), as the strategy's locate() left it in
+    // `memo.account`: also where it found no source, as limits are the account's, not the session's.
+    // None while the strategy says this pane's own session has no plan limits (`memo.plan.on`
+    // false: an API key, another endpoint): the account is the other panes', the pane shows none.
+    this.account = null;
+    this.accountAsked = null; // the account and process the ask went out for (`account#pid`)
     this.closed = false;
     this.job = null; // the look in the queue: released at close()
+    this.side = null; // the ask for the account's kept files, a job of its own: released at close()
   }
 
   // From the header's render: its pane as panes() has it, and whether its tab is on screen.
@@ -134,6 +147,12 @@ export class ContextReader {
       this.terminal = terminal;
       this.strategy = strategy;
       this.reading = null;
+      this.account = null;
+      this.accountAsked = null;
+      // The ask for the last program's account is not this one's: its place in the queue goes
+      // (close() could no longer reach it once the next ask takes `side`).
+      this.side?.release();
+      this.side = null;
       this.key = this.stats = null;
       this.memo = {};
       this.misses = 0;
@@ -176,6 +195,8 @@ export class ContextReader {
     this.cancel();
     this.job?.release();
     this.job = null;
+    this.side?.release();
+    this.side = null;
   }
 
   arm(cx, ms) {
@@ -213,9 +234,49 @@ export class ContextReader {
       }
       const hint = idleHint(this.reading, this.status, this.io.now());
       if (hint !== this.hint) { this.hint = hint; changed = true; }
+      const account = offPlan(this.memo) ? null : this.memo.account ?? null;
+      if (account !== this.account) { this.account = account; changed = true; }
       if (changed) cx.notify();
+      this.askAccount();
       if (this.again) { this.again = false; this.arm(cx, 0); } else this.arm(cx, this.delay());
     });
+  }
+
+  // An agent has started in this pane (a new pane, or a shell that became one): once, as soon as
+  // its account is known (and once more should it run on another account later), what the account's
+  // other files say goes to the store, so a session that
+  // hasn't answered yet shows its limits. At most once a minute per account (store.due, noted as the
+  // job starts: an ask released while it waits takes no other pane's turn); a failure costs nothing
+  // but the limits.
+  // After the pane's own look is out (also one that found no source), as a job of its own in the
+  // queue: the pane's own number never waits for it, and the header's 2 s look draws what it
+  // brings. It works on the account and folder as they are now, not on `memo`, which belongs to
+  // whatever runs in the pane later; it tells the store only, and nothing about this pane. Still
+  // waiting when the pane closes or runs another program, it never starts (released, and its
+  // generation is gone); already running, it frees its place and its answer is the account's all
+  // the same.
+  askAccount() {
+    const { io, strategy, memo } = this;
+    // Per process, not per account alone: an agent restarted in the pane on the same account (its
+    // session not answered yet) asks again; store.due still keeps it to once a minute per account.
+    const asked = `${memo.account}#${memo.pid ?? ""}`;
+    if (this.accountAsked === asked || this.closed || !memo.account || offPlan(memo) || !strategy?.accountLimits || !io.limits) return;
+    // Another account or process than the last ask's (a restart, its own config folder): the
+    // last ask's place goes, as in see(), so close() can still reach the one that follows.
+    this.side?.release();
+    this.side = null;
+    this.accountAsked = asked;
+    const about = { account: memo.account, home: memo.home };
+    const gen = this.gen;
+    const side = this.queue.enter(async () => {
+      if (this.closed || gen !== this.gen) return false;
+      // Several panes of an account starting at once: the first job that runs asks, the others end here.
+      if (!io.limits.due(about.account, io.now())) return false;
+      try { await strategy.accountLimits(io, about); } catch {}
+      return false;
+    });
+    this.side = side;
+    side.promise.catch(() => {}).finally(() => { if (this.side === side) this.side = null; });
   }
 
   // How long until the next look: a backoff only after misses (nothing found, a failed read).
@@ -276,7 +337,10 @@ export class ContextReader {
     if (gen !== this.gen) return false;
     // No answer from hc (slow, failed) proves nothing: the reading stands, the next look checks again.
     if (!fg) { this.key = this.stats = null; return false; }
-    if (fg.pid !== src.pid || strategy.stillSame?.(src, fg) === false) { this.key = this.stats = null; return this.set(null, gen); }
+    // Another pid: the process located is gone, and with it what locate() said of it (its account,
+    // its plan). Another thread of the same process (stillSame) keeps them: its config folder is the same.
+    if (fg.pid !== src.pid) { forgetProcess(this.memo); this.key = this.stats = null; return this.set(null, gen); }
+    if (strategy.stillSame?.(src, fg) === false) { this.key = this.stats = null; return this.set(null, gen); }
     // Read without a number: the meter goes, with no backoff; its stats are kept only where the
     // strategy says the file alone decides (then read again only when a file changes).
     if (r === NO_READING) {

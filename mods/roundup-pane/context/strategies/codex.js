@@ -11,8 +11,9 @@
 //   of its descendants holds open (lsof), asked on every look: `/new` or a resume opens another
 //   one in the same process. A shared daemon's files lie outside the process tree.
 
-import { NO_ANSWER, foreground, processEnv, byTitle, titleIds, byOpenFile, uuid7Time, localParts, parseJson } from "../locate.js";
-import { scanTail, fromEnd, NO_READING } from "../tail.js";
+import { NO_ANSWER, foreground, forgetProcess, processEnv, byTitle, titleIds, byOpenFile, uuid7Time, localParts, parseJson, normalizeFolder, eachLimited, ACCOUNT_AT_ONCE } from "../locate.js";
+import { scanTail, fromEnd, completeLines, FIRST, NO_READING } from "../tail.js";
+import { codexLimits, CODEX_EVENTS } from "../../limits/parse.js";
 
 const ROLLOUT = /\/rollout-[^/]*\.jsonl$/;
 const DAY = 24 * 60 * 60 * 1000;
@@ -88,9 +89,48 @@ export function findRollout(lines, whole) {
   return { ...tc, model: laterModel ?? tcModel };
 }
 
+export const ACCOUNT_FILES = 5;
+export const ACCOUNT_DAYS = 8; // a weekly window, and a day
+
+// The rollouts written last, newest first, at most `n`, none written more than `days` ago. A
+// thread's rollout stays in the folder of the day it started, also when it is resumed weeks later:
+// one find over all of sessions/ gives each file's mtime (io.recentFiles), and the newest writes
+// count, whatever their names (equal times: the later name first). Where that fails (no find, a
+// folder it can't read: null), the day folders of the last `days` are walked by name instead, which
+// goes by the start: sessions/YYYY/MM/DD/rollout-<stamp>-<id>.jsonl sort by their names.
+export async function newestRollouts(io, home, n = ACCOUNT_FILES, days = ACCOUNT_DAYS) {
+  const root = `${home}/sessions`;
+  const recent = (await io.recentFiles?.(root, "rollout-*.jsonl", days * 1440)) ?? null;
+  if (Array.isArray(recent)) {
+    const name = (p) => p.slice(p.lastIndexOf("/") + 1);
+    const later = (a, b) => (a > b ? -1 : a < b ? 1 : 0);
+    return recent.filter((f) => /^rollout-.*\.jsonl$/.test(name(f.path)))
+      .sort((a, b) => b.mtime - a.mtime || later(name(a.path), name(b.path)))
+      .slice(0, n).map((f) => f.path);
+  }
+  const sorted = async (dir, re) => ((await io.list(dir)) ?? []).filter((x) => re.test(x)).sort().reverse();
+  const from = localParts(io.now() - days * DAY);
+  const oldest = `${from.y}/${from.mo}/${from.d}`;
+  const files = [];
+  for (const y of await sorted(root, /^\d{4}$/)) {
+    for (const mo of await sorted(`${root}/${y}`, /^\d{2}$/)) {
+      for (const d of await sorted(`${root}/${y}/${mo}`, /^\d{2}$/)) {
+        if (`${y}/${mo}/${d}` < oldest) return files;
+        for (const name of await sorted(`${root}/${y}/${mo}/${d}`, /^rollout-.*\.jsonl$/)) {
+          files.push(`${root}/${y}/${mo}/${d}/${name}`);
+          if (files.length >= n) return files;
+        }
+      }
+    }
+  }
+  return files;
+}
+
 export default {
   id: "codex",
   matches: ["codex"],
+  // The environment keys locate() reads (context-io.js builds parseEnv's list from these).
+  envKeys: ["CODEX_HOME"],
   // A rollout read without a number (a compaction or model change after the last count) stays
   // so until the file changes: the reader keeps its stats then, and reads it again only then.
   keepsNoReading: true,
@@ -109,14 +149,32 @@ export default {
   // `memo`: the reader's per-terminal store (empty again for another terminal or program).
   async locate(agent, io, memo = {}) {
     const fg = await foreground(io, agent.terminal);
-    if (!fg || fg === NO_ANSWER) return fg;
+    if (fg === NO_ANSWER) return fg;
+    if (!fg) { forgetProcess(memo); return null; }
     const env = await processEnv(io, fg.pid, memo);
-    if (env?.HC_TERMINAL_ID && env.HC_TERMINAL_ID !== agent.terminal) return null;
-    const home = env?.CODEX_HOME || `${io.home}/.codex`;
-    const base = { id: "codex", terminal: agent.terminal, pid: fg.pid };
+    // Another terminal's agent: its account and plan aren't this pane's.
+    if (env?.HC_TERMINAL_ID && env.HC_TERMINAL_ID !== agent.terminal) { forgetProcess(memo); return null; }
+    const home = normalizeFolder(env?.CODEX_HOME || `${io.home}/.codex`);
+    // The account for the plan limits (limits/store.js): the config folder, known before a rollout is.
+    // Only from an environment that was read: where `ps` failed this look, the default folder may not
+    // be this process's, so the account is unknown (nothing shown, offered or asked for) until a look
+    // reads it; the source then names no account either. The rollout is still searched for in the
+    // default folder.
+    memo.account = env ? `codex:${home}` : null;
+    memo.home = env ? home : null;
+    // The process the account was read for: another one (a restart in the pane) asks the account's
+    // files once more (reader.js, askAccount).
+    memo.pid = env ? fg.pid : null;
+    // Whether this pane shows them is its own matter (`memo.plan`, { pid, key: rollout, on }, set by
+    // read() from this session's rollout, heeded by the reader): it holds for the process that said so.
+    if (memo.plan && memo.plan.pid !== fg.pid) memo.plan = null;
+    const base = { id: "codex", terminal: agent.terminal, pid: fg.pid, account: memo.account };
     // A thread id in the title names the thread: then only its rollout counts. `titlePrefix` is
     // what the title said, for the reader's check after the read (the title still says it).
     const prefix = byTitle(fg.title);
+    // The title names another thread than the one that said it (`/new`, a resume): that word is not
+    // this thread's, also before its rollout is there to say anything.
+    if (prefix && memo.plan?.key && !rolloutId(memo.plan.key.slice(memo.plan.key.lastIndexOf("/") + 1))?.startsWith(prefix)) memo.plan = null;
     if (prefix) {
       const file = await rolloutByPrefix(io, home, prefix, memo);
       if (file === AMBIGUOUS) return null;
@@ -149,8 +207,38 @@ export default {
     return { ...base, file: users[0], thread, titlePrefix: prefix, how: prefix ? "title+open-file" : "open-file", files: [users[0]] };
   },
 
-  async read(source, io) {
-    const r = await scanTail(io, source.file, findRollout);
+  // The account's limits from the rollouts started last (the reader asks once when Codex starts in
+  // a pane: a new thread has no rollout or no token_count yet). Every thread of the account
+  // carries them, whoever's it is: the end of each is read, and the store keeps what is newest.
+  async accountLimits(io, memo) {
+    if (!memo.home || !memo.account) return;
+    await eachLimited(await newestRollouts(io, memo.home), ACCOUNT_AT_ONCE, async (file) => {
+      const chunk = await io.tail(file, FIRST);
+      if (!chunk || typeof chunk.text !== "string") return;
+      io.limits.offer(memo.account, codexLimits(completeLines(chunk.text, chunk.whole)).reading);
+    });
+  },
+
+  async read(source, io, memo = {}) {
+    // The same lines carry the account's plan limits (`rate_limits` of the newest token_counts,
+    // also where a compaction after them leaves no context number): offered to the store all
+    // headers share (`io.limits`). A larger end holds all of a smaller one, so the last walk counts.
+    let limits = null;
+    const r = await scanTail(io, source.file, (lines, whole) => {
+      limits = { ...codexLimits(lines), whole };
+      return findRollout(lines, whole);
+    });
+    // This session's own word (parse.js, codexLimits): limits mean it has them. Events without
+    // default-pool limits mean it has none, and the pane shows none: only where the read came to
+    // an end (a failed larger tail leaves a walk of the smaller one, which proves nothing) and the
+    // walk saw all it looks at (CODEX_EVENTS events, or the whole file). Anything less says
+    // nothing, and what this rollout said before stands. Never from another session's file
+    // (accountLimits).
+    if (limits?.reading) {
+      if (source.account) io.limits?.offer(source.account, limits.reading);
+      memo.plan = { pid: source.pid, key: source.file, on: true };
+    } else if (r !== null && limits?.events > 0 && (limits.events >= CODEX_EVENTS || limits.whole)) memo.plan = { pid: source.pid, key: source.file, on: false };
+    else if (memo.plan && memo.plan.key !== source.file) memo.plan = null;
     if (r === NO_READING) return NO_READING;
     if (!r) return null;
     return {

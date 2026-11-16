@@ -24,6 +24,69 @@ test("parseEnv takes the environment's value, the last of a key (arguments come 
   assert.equal(parseEnv(null), null);
 });
 
+test("parseEnv keeps a value with spaces whole up to the next variable or the line's end: two config folders with a space stay two accounts", async () => {
+  const ps = (home) => `/opt/codex/bin/codex resume HC_TERMINAL_ID=t7 CODEX_HOME=${home} PATH=/bin:/usr/bin\n`;
+  assert.equal(parseEnv(ps("/Users/a/Codex Personal")).CODEX_HOME, "/Users/a/Codex Personal");
+  assert.equal(parseEnv(ps("/Users/a/Codex Work")).CODEX_HOME, "/Users/a/Codex Work");
+  // The last variable runs to the line's end, trailing blanks aside; an empty value stays empty.
+  assert.deepEqual(parseEnv("claude HC_TERMINAL_ID=t7 CLAUDE_CONFIG_DIR=/Users/a/Claude Work  \n"), { HC_TERMINAL_ID: "t7", CLAUDE_CONFIG_DIR: "/Users/a/Claude Work" });
+  assert.deepEqual(parseEnv("codex CODEX_HOME= HC_TERMINAL_ID=t7\n"), { CODEX_HOME: "", HC_TERMINAL_ID: "t7" });
+  // Through the strategy: the account is the whole folder.
+  const { contextIo } = await import("./support/context-io.mjs");
+  const codex = (await import("../mods/roundup-pane/context/strategies/codex.js")).default;
+  const accounts = [];
+  for (const home of ["/Users/a/Codex Personal", "/Users/a/Codex Work"]) {
+    const io = contextIo({ terminals: { t7: { pid: 4242, created: 0, title: "codex", cwd: "/Users/a/src" } } });
+    io.env = async () => parseEnv(ps(home));
+    const memo = {};
+    await codex.locate({ terminal: "t7" }, io, memo);
+    accounts.push(memo.account);
+    assert.equal(memo.home, home);
+    assert.equal(memo.pid, 4242, "the process the account was read for");
+  }
+  assert.deepEqual(accounts, ["codex:/Users/a/Codex Personal", "codex:/Users/a/Codex Work"]);
+});
+
+test("Claude's off-plan switches reach the strategy through parseEnv: Bedrock, Vertex and Foundry switched on hide the pane's limits, offer none, ask none", async () => {
+  const { contextIo, fixture } = await import("./support/context-io.mjs");
+  const { makeStore } = await import("../mods/roundup-pane/limits/store.js");
+  const { integrationFile } = await import("../mods/roundup-pane/context/locate.js");
+  const { ContextReader } = await import("../mods/roundup-pane/context/reader.js");
+  const claude = (await import("../mods/roundup-pane/context/strategies/claude.js")).default;
+  const stdin = JSON.parse(fixture("claude-status-stdin.json"));
+  const pid = 52896, started = 1794613515093;
+  // The environment as Herdr's io has it: `ps -wwE`'s text through parseEnv, not a made-up object.
+  const paneIo = (vars) => {
+    const io = contextIo({ terminals: { t7: { pid, created: started - 4000, title: "Claude Code", cwd: "/Users/a/src/demo" } } });
+    io.env = async () => parseEnv(`/opt/claude/bin/claude HC_TERMINAL_ID=t7 ${vars} PATH=/bin\n`);
+    io.files[`/Users/a/.claude/sessions/${pid}.json`] = JSON.stringify({ pid, sessionId: stdin.session_id, cwd: "/Users/a/src/demo", startedAt: started, kind: "interactive" });
+    io.files[integrationFile(io, "claude", "t7")] = JSON.stringify({ v: 1, terminal: "t7", pid, at: 1, limitsAt: 1, claude: stdin });
+    io.limits = makeStore();
+    return io;
+  };
+  for (const k of ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"]) {
+    const io = paneIo(`${k}=1`);
+    const memo = {};
+    assert.ok(await claude.locate({ terminal: "t7" }, io, memo));
+    assert.equal(memo.plan?.on, false, `${k}=1: off the plan`);
+    assert.equal(io.limits.get(memo.account), null, `${k}=1: its file's numbers aren't offered`);
+    // The reader shows no account for it and asks nothing.
+    let asks = 0;
+    const reader = new ContextReader(io, { strategies: [{ ...claude, accountLimits: async () => { asks++; } }], queue: makeQueue(2) });
+    const cx = makeCx();
+    reader.see({ terminal: "t7", program: { key: "claude" }, app: null, status: "idle" }, true, cx);
+    await clock.advance(2000);
+    assert.equal(reader.account, null);
+    assert.equal(asks, 0);
+    reader.close();
+  }
+  const off = paneIo("CLAUDE_CODE_USE_BEDROCK=0");
+  const memo = {};
+  await claude.locate({ terminal: "t7" }, off, memo);
+  assert.notEqual(memo.plan?.on, false, "named, but switched off");
+  assert.ok(off.limits.get(memo.account));
+});
+
 test("parseStat reads macOS' and GNU's size and mtime in ms; parseLsof the open paths", () => {
   assert.deepEqual(parseStat("5280 1794339085.804695647\n"), { size: 5280, mtime: 1794339085805 });
   assert.deepEqual(parseStat("12 1794339085\n"), { size: 12, mtime: 1794339085000 });
@@ -182,4 +245,94 @@ test("lastLinesWith through the real awk: the last n of the lines with the text 
   const all = await io.lastLinesWith(f, "## Context Usage", SNAPSHOT_META, 150, 8);
   assert.deepEqual(all.map((l) => JSON.parse(l).n), [5, 3, 2, 1], "the plain mention and the escaped copy never match");
   assert.deepEqual(await io.lastLinesWith(f, "## nothing", SNAPSHOT_META, 150, 8), []);
+});
+
+test("every strategy's environment keys reach it through parseEnv, and HC_TERMINAL_ID for all", async () => {
+  const { STRATEGIES } = await import("../mods/roundup-pane/context/registry.js");
+  const keys = [...new Set(["HC_TERMINAL_ID", ...STRATEGIES.flatMap((s) => s.envKeys ?? [])])];
+  assert.ok(keys.includes("CLAUDE_CODE_USE_BEDROCK") && keys.includes("CODEX_HOME") && keys.includes("CLAUDE_CONFIG_DIR"));
+  const ps = `agent ${keys.map((k, i) => `${k}=v${i}`).join(" ")} OTHER=x\n`;
+  assert.deepEqual(parseEnv(ps), Object.fromEntries(keys.map((k, i) => [k, `v${i}`])), "each declared key, nothing else");
+});
+
+test("parseRecent reads find's mtime and path lines, macOS' and GNU's, a path with spaces whole; junk is skipped", async () => {
+  const { parseRecent } = await import("../mods/roundup-pane/context-io.js");
+  assert.deepEqual(parseRecent("1794850000.123456789 /a/b c/rollout-1.jsonl\n1794850001 /a/r.jsonl\njunk\n\n"), [
+    { path: "/a/b c/rollout-1.jsonl", mtime: 1794850000123 }, { path: "/a/r.jsonl", mtime: 1794850001000 }]);
+  assert.deepEqual(parseRecent(""), []);
+  assert.equal(parseRecent(null), null);
+});
+
+test("recentFiles: one find under the root, files only, by name and write time, a linked root followed; none is [], a failed find null", async () => {
+  const { utimesSync, mkdirSync, symlinkSync } = await import("node:fs");
+  const root = join(dir, "codex home", "sessions");
+  const now = Date.now() / 1000;
+  const put = (rel, ageDays) => {
+    const p = join(root, rel);
+    mkdirSync(join(p, ".."), { recursive: true });
+    writeFileSync(p, "{}\n");
+    utimesSync(p, now - ageDays * 86400, now - ageDays * 86400);
+    return p;
+  };
+  const old = put("2026/10/01/rollout-2026-10-01T09-00-00-a.jsonl", 0.01); // started long ago, written now
+  const fresh = put("2026/11/15/rollout-2026-11-15T09-00-00-b.jsonl", 1);
+  put("2026/11/01/rollout-2026-11-01T09-00-00-c.jsonl", 10); // written ten days ago
+  put("2026/11/15/notes.txt", 0);
+  mkdirSync(join(root, "2026/11/15/rollout-dir.jsonl"), { recursive: true }); // a folder by that name
+  const io = makeIo();
+  const got = await io.recentFiles(root, "rollout-*.jsonl", 8 * 1440);
+  assert.deepEqual(got.map((f) => f.path).sort(), [old, fresh].sort());
+  const byPath = Object.fromEntries(got.map((f) => [f.path, f.mtime]));
+  assert.ok(Math.abs(byPath[old] - (now - 0.01 * 86400) * 1000) < 2000, "the write time in ms");
+  // A root that is a link.
+  const link = join(dir, "linked-sessions");
+  symlinkSync(root, link);
+  assert.equal((await io.recentFiles(link, "rollout-*.jsonl", 8 * 1440)).length, 2);
+  assert.deepEqual(await io.recentFiles(root, "nothing-*.jsonl", 8 * 1440), [], "none: an answer");
+  assert.equal(await io.recentFiles(join(dir, "missing"), "rollout-*.jsonl", 8 * 1440), null, "find fails: null");
+  herdr.failExec("find");
+  assert.equal(await io.recentFiles(root, "rollout-*.jsonl", 8 * 1440), null, "no find: null");
+});
+
+test("recentFiles on GNU: the mac form failing gives way to -printf, a known GNU form asks -printf first, an empty answer sets no form, cut output is null", async () => {
+  // A module of its own per case: the stat form is the module's, found once.
+  const fresh = async (tag) => (await import(`../mods/roundup-pane/context-io.js?${tag}`)).makeIo();
+  const root = "/home/a/.codex/sessions";
+  const base = ["-H", root, "-type", "f", "-name", "rollout-*.jsonl", "-mmin", "-11520"];
+  const MAC = [...base, "-exec", "stat", "-f", "%Fm %N", "{}", "+"], GNU = [...base, "-printf", "%T@ %p\\n"];
+  const gnuOut = "1794850000.5 /home/a/.codex/sessions/2026/10/01/rollout a.jsonl\n";
+  const calls = [];
+  // GNU: stat -f is the file system's status, and the mac form's find fails; -printf answers.
+  herdr.onExec((c) => {
+    if (c.command === "find") { calls.push(c.args); return c.args.includes("-printf") ? { code: 0, stdout: gnuOut, stderr: "" } : { code: 1, stdout: "", stderr: "stat: cannot read file system information for '%Fm %N'" }; }
+    if (c.command === "stat") return c.args[0] === "-c" ? { code: 0, stdout: "12 1794850000.000000000\n", stderr: "" } : { code: 1, stdout: "", stderr: "" };
+    return undefined;
+  });
+  let io = await fresh("gnu-unknown");
+  assert.deepEqual(await io.recentFiles(root, "rollout-*.jsonl", 8 * 1440), [{ path: "/home/a/.codex/sessions/2026/10/01/rollout a.jsonl", mtime: 1794850000500 }]);
+  assert.deepEqual(calls, [MAC, GNU], "the mac form first, then GNU's");
+  // Known GNU (stat found it): -printf only.
+  io = await fresh("gnu-known");
+  assert.ok(await io.stat("/x"));
+  calls.length = 0;
+  await io.recentFiles(root, "rollout-*.jsonl", 8 * 1440);
+  assert.deepEqual(calls, [GNU]);
+  // An empty answer of the mac form (no files: stat never ran) is an answer, and sets no form:
+  // stat() still finds GNU's afterwards.
+  reset();
+  const statArgs = [];
+  herdr.onExec((c) => {
+    if (c.command === "find") return { code: 0, stdout: "", stderr: "" };
+    if (c.command === "stat") { statArgs.push(c.args[0]); return c.args[0] === "-c" ? { code: 0, stdout: "12 1794850000.000000000\n", stderr: "" } : { code: 1, stdout: "", stderr: "" }; }
+    return undefined;
+  });
+  io = await fresh("gnu-empty");
+  assert.deepEqual(await io.recentFiles(root, "rollout-*.jsonl", 8 * 1440), []);
+  assert.deepEqual(await io.stat("/x"), { size: 12, mtime: 1794850000000 });
+  assert.deepEqual(statArgs, ["-f", "-c"], "stat tried the mac form first: the empty find had set nothing");
+  // Output cut at exec's limit: null, not part of a list.
+  reset();
+  herdr.onExec((c) => (c.command === "find" ? { code: 0, stdout: `1 /a/rollout-x.jsonl\n`.repeat(8 * 1024 * 1024 / 20), stderr: "" } : undefined));
+  io = await fresh("cut");
+  assert.equal(await io.recentFiles(root, "rollout-*.jsonl", 8 * 1440), null);
 });

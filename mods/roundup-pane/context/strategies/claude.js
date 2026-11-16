@@ -7,8 +7,9 @@
 //   → status line file ~/.cache/herdr-roundup/context/claude/<t>.json, if its pid and session match
 //   → transcript: the status line's transcript_path, else projects/<cwd slug>/<sessionId>.jsonl
 
-import { NO_ANSWER, foreground, processEnv, observeJsonFile, observeTerminalFile, parseJson } from "../locate.js";
+import { NO_ANSWER, foreground, forgetProcess, processEnv,observeJsonFile, observeTerminalFile, parseJson, normalizeFolder, eachLimited, ACCOUNT_AT_ONCE } from "../locate.js";
 import { scanTail, fromEnd, NO_READING } from "../tail.js";
+import { fromClaude } from "../../limits/parse.js";
 
 export const IDLE_COMPACT_MS = 55 * 60 * 1000; // observed on this machine, see RECIPE
 export const IDLE_COMPACT_FROM = 200_000;
@@ -23,6 +24,18 @@ export const SNAPSHOT_META = '"isMeta"[[:space:]]*:[[:space:]]*true';
 // filtered lines that are no snapshot follow the last one, the window stays unknown (tokens only).
 export const SNAPSHOT_CANDIDATES = 8;
 const COMPACT_ENV = ["CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"];
+// accountLimits reads every terminal's file, a few at a time, up to a bound only a runaway folder
+// reaches: past it, which files are read is chance (best effort; the sweep keeps live terminals).
+export const ACCOUNT_READS = 500;
+
+// The process doesn't run on the plan: it is told to use Bedrock, Vertex or Foundry (switched on
+// as Claude Code reads such a switch). An API key, a token or another endpoint (ANTHROPIC_BASE_URL:
+// a pass-through proxy may still carry the subscription) decides nothing: such a pane shows its
+// account's limits until its own first answer says otherwise (claudePlan, below). The strategy
+// names the keys it reads (`envKeys`): context-io.js's parseEnv keeps those, so this list is the one.
+const ON = new Set(["1", "true", "yes", "on"]);
+const OFF_PLAN = ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"];
+export const offPlan = (env) => Boolean(env) && (OFF_PLAN.some((k) => ON.has(String(env[k] ?? "").trim().toLowerCase())));
 
 // A folder as Claude Code names its project folder: every character not a letter or digit is "-".
 export const slug = (cwd) => cwd.replace(/[^a-zA-Z0-9]/g, "-");
@@ -119,9 +132,33 @@ export function parseSnapshot(line) {
   return { model, window, buffer, at, session: l.sessionId ?? null };
 }
 
+// Whether this process's session runs on the plan, as `memo.plan` keeps it: { pid, key, on }, `key`
+// the session (null: by the environment, offPlan, which locate() sets itself), `on` true or false;
+// null while nothing is known (the pane shows its account's limits). From `prev`, the pid, the
+// session (null: not known yet) and the session's own status line file (`own`, null without one):
+// - another process, or another session of it, starts with nothing known; so does a process whose
+//   environment no longer says it is off the plan;
+// - a status with `rate_limits`: on the plan, for good in this process and session (a later status
+//   without them, a call that brought no limit headers, doesn't hide them);
+// - an answer seen in this process without them: off the plan. Seen means the integration's
+//   `limitsAt` is a number: the script sets it only when the API time grew over its last file of the
+//   same process and session. The API time alone proves nothing: a resumed session gets its old one
+//   back before it answers;
+// - no file of this session (not written yet, not readable this time): what it said before stands.
+export function claudePlan(prev, pid, session, own) {
+  const kept = prev && prev.pid === pid && prev.key !== null && (session === null || prev.key === session) ? prev : null;
+  if (!own || session === null) return kept;
+  if (own.claude?.rate_limits && typeof own.claude.rate_limits === "object") return { pid, key: session, on: true };
+  if (kept?.on) return kept;
+  if (Number.isFinite(own.limitsAt)) return { pid, key: session, on: false };
+  return kept;
+}
+
 export default {
   id: "claude",
   matches: ["claude", "claude-code"],
+  // The environment keys locate() reads (context-io.js builds parseEnv's list from these).
+  envKeys: ["CLAUDE_CONFIG_DIR", ...COMPACT_ENV, ...OFF_PLAN],
   // No number may also mean the status line file couldn't be read this time (readText gives null
   // for both): the reader reads again on every look then, without a backoff, but keeps no stats.
   keepsNoReading: false,
@@ -129,11 +166,26 @@ export default {
   // `memo`: the reader's per-terminal store (empty again for another terminal or program).
   async locate(agent, io, memo = {}) {
     const fg = await foreground(io, agent.terminal);
-    if (!fg || fg === NO_ANSWER) return fg;
+    if (fg === NO_ANSWER) return fg;
+    if (!fg) { forgetProcess(memo); return null; }
     const env = await processEnv(io, fg.pid, memo);
-    // The process's environment names its terminal: another one's means another terminal's agent.
-    if (env?.HC_TERMINAL_ID && env.HC_TERMINAL_ID !== agent.terminal) return null;
-    const home = env?.CLAUDE_CONFIG_DIR || `${io.home}/.claude`;
+    // The process's environment names its terminal: another one's means another terminal's agent,
+    // whose account and plan aren't this pane's.
+    if (env?.HC_TERMINAL_ID && env.HC_TERMINAL_ID !== agent.terminal) { forgetProcess(memo); return null; }
+    const home = normalizeFolder(env?.CLAUDE_CONFIG_DIR || `${io.home}/.claude`);
+    // The account for the plan limits (limits/store.js): the config folder, known before a session is.
+    // Only from an environment that was read: where `ps` failed this look, the default folder may not
+    // be this process's, so the account is unknown (nothing shown, offered or asked for) until a look
+    // reads it. The session is still searched for in the default folder.
+    memo.account = env ? `claude:${home}` : null;
+    memo.home = env ? home : null;
+    // The process the account was read for: another one (a restart in the pane) asks the account's
+    // files once more (reader.js, askAccount).
+    memo.pid = env ? fg.pid : null;
+    // Whether this pane shows them is its own matter (`memo.plan`, which the reader heeds): the
+    // account stays the other panes'.
+    const byEnv = offPlan(env);
+    memo.plan = byEnv ? { pid: fg.pid, key: null, on: false } : claudePlan(memo.plan, fg.pid, null, null);
     // Each file of the source is observed once per look, here, its stat before its content
     // (locate.js, observeJsonFile): the reader takes these stats (`observed`) and asks none again,
     // so no stat can be newer than what was read. The session file, then the status line file,
@@ -142,6 +194,10 @@ export default {
     const session = checkSession(sessionFile.json, fg);
     if (!session) return null;
     const status = await observeTerminalFile(io, "claude", agent.terminal, fg.pid);
+    // The status line's stdin carries the account's plan limits too: offered to the store all
+    // headers share (`io.limits`; the file is this terminal's and this process's, so this account's).
+    if (status.file && !byEnv && memo.account) io.limits?.offer(memo.account, fromClaude(status.file));
+    if (!byEnv) memo.plan = claudePlan(memo.plan, fg.pid, session.sessionId, status.file?.claude?.session_id === session.sessionId ? status.file : null);
     const path = status.file?.claude?.session_id === session.sessionId ? status.file.claude.transcript_path : null;
     // The status line's path first, then the slug's: both asked on every look, the folder search
     // (held after a miss) only when neither is there.
@@ -168,6 +224,25 @@ export default {
       files: [sessionFile.path, status.path, transcript?.path].filter(Boolean),
       observed: { [sessionFile.path]: sessionFile.stat, [status.path]: status.stat, ...(transcript && { [transcript.path]: transcript.stat }) },
     };
+  },
+
+  // The account's limits as the integration kept them for other terminals (the reader asks once
+  // when Claude starts in a pane: a session before its first answer has none of its own). A file
+  // counts when its session's transcript lies under this config folder: the same account. Files
+  // of ended terminals count too, until the sweep removes them: the store keeps what is newest, so
+  // every file is read (ACCOUNT_READS), not the first few, whose order the folder doesn't give.
+  async accountLimits(io, memo) {
+    if (!memo.home || !memo.account) return;
+    const dir = `${io.home}/.cache/herdr-roundup/context/claude`;
+    const names = ((await io.list(dir)) ?? []).filter((n) => /^[A-Za-z0-9_-]+\.json$/.test(n)).slice(0, ACCOUNT_READS);
+    // Normalized as a whole, so a config folder "/" gives "/projects/", not "//projects/".
+    const under = `${normalizeFolder(`${memo.home}/projects`)}/`;
+    await eachLimited(names, ACCOUNT_AT_ONCE, async (name) => {
+      const f = parseJson(await io.readText(`${dir}/${name}`));
+      const path = f?.claude?.transcript_path;
+      if (f?.v !== 1 || typeof path !== "string" || !normalizeFolder(path).startsWith(under)) return;
+      io.limits.offer(memo.account, fromClaude(f));
+    });
   },
 
   // `memo` is the reader's per-terminal store: the snapshot search runs once per session and then

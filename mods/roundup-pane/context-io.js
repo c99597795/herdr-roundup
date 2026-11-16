@@ -7,6 +7,7 @@
 
 import { exec, hc, home, readTextFile } from "herdr";
 import * as fs from "fs/promises";
+import { STRATEGIES } from "./context/registry.js";
 
 const T = 5_000;
 export const HC_MS = 5_000;
@@ -19,14 +20,18 @@ const run = async (cmd, args, timeout = T) => {
     return null;
   }
 };
-// The environment keys a strategy looks at, from `ps -wwE`: the arguments come first, so the
-// last occurrence of a key is the environment's. A value with a space is cut there.
-const ENV_KEYS = ["HC_TERMINAL_ID", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"];
+// The environment keys the strategies look at, from `ps -wwE`: HC_TERMINAL_ID (every strategy
+// checks the terminal) and each strategy's own (`envKeys`), so a key a strategy reads is always
+// kept. The arguments come first, so the last occurrence of a key is the environment's. ps joins
+// the variables with spaces, so a value runs to the next ` NAME=` or the line's end: a config
+// folder with a space (`/Users/a/Codex Work`) stays whole, and two such folders stay two accounts.
+// Only a value that itself holds ` NAME=` is cut there.
+export const ENV_KEYS = [...new Set(["HC_TERMINAL_ID", ...STRATEGIES.flatMap((s) => s.envKeys ?? [])])];
 export function parseEnv(text) {
   if (typeof text !== "string") return null;
   const env = {};
   for (const k of ENV_KEYS) {
-    const all = [...text.matchAll(new RegExp(`(?:^|\\s)${k}=(\\S*)`, "g"))];
+    const all = [...text.matchAll(new RegExp(`(?:^|\\s)${k}=([^\\n]*?)(?=\\s+[A-Za-z_]\\w*=|\\s*(?:\\n|$))`, "g"))];
     if (all.length) env[k] = all[all.length - 1][1];
   }
   return env;
@@ -35,6 +40,19 @@ export function parseEnv(text) {
 export function parseStat(text) {
   const m = /^(\d+) (\d+(?:\.\d+)?)\s*$/.exec(text ?? "");
   return m ? { size: Number(m[1]), mtime: Math.round(Number(m[2]) * 1000) } : null;
+}
+// `find … -exec stat -f '%Fm %N' {} +` (macOS) or `find … -printf '%T@ %p\n'` (GNU): one line per
+// file, its mtime in seconds (with a fraction), a space, its path (which may hold spaces) →
+// [{ path, mtime }] with mtime in ms. A line of another form is skipped; no text: null.
+export function parseRecent(text) {
+  if (typeof text !== "string") return null;
+  const files = [];
+  for (const line of text.split("\n")) {
+    const m = /^(\d+(?:\.\d+)?) (.+)$/.exec(line);
+    const mtime = m ? Math.round(Number(m[1]) * 1000) : NaN;
+    if (Number.isFinite(mtime)) files.push({ path: m[2], mtime });
+  }
+  return files;
 }
 // `lsof -Fn`: one "n<path>" line per open file.
 export const parseLsof = (text) => (typeof text === "string" ? text.split("\n").filter((l) => l.startsWith("n/")).map((l) => l.slice(1)) : null);
@@ -67,7 +85,8 @@ let statForm = null; // "mac" or "gnu", found on the first call
 // It gives hc get a deadline: a slow hc frees its place in the reader's queue after HC_MS and
 // counts as no answer. The race doesn't stop hc itself, whose late answer is dropped. Without
 // `after` (the sweeper, which never asks hc) there is no deadline.
-export function makeIo({ after = null } = {}) {
+// `limits`: the store the strategies offer an account's plan limits to (limits/store.js).
+export function makeIo({ after = null, limits = null } = {}) {
   // One hc call, its JSON answer through `pick`, bounded by HC_MS where there is a timer.
   const ask = async (args, pick) => {
     let timer = null;
@@ -86,6 +105,7 @@ export function makeIo({ after = null } = {}) {
   };
   const io = {
     home: home(),
+    limits,
     now: () => Date.now(),
     terminal: (t) => ask(["get", t, "--json"], (j) => ({ pid: j.foreground?.pid ?? null, created: j.created_ms ?? null, title: j.title ?? "", cwd: j.foreground?.cwd ?? j.cwd ?? null })),
     // The screen only (no history above it): `{ text }` of `hc read`.
@@ -103,6 +123,19 @@ export function makeIo({ after = null } = {}) {
       const out = await run("stat", ["-c", "%s %.9Y", p]);
       if (out !== null) statForm = "gnu";
       return parseStat(out);
+    },
+    // The files under `root` named like `name` (a find pattern) written within the last `minutes`,
+    // as [{ path, mtime }] (parseRecent), or null: find failed (a folder it couldn't read too) or its
+    // output was cut. [] is an answer: none. `-H` follows a root that is a link. One find, which on
+    // macOS runs stat on its files in batches; GNU's find prints the times itself. The mac form is
+    // tried first unless stat() found GNU, and the answer sets no form: with no files, macOS's
+    // never ran stat, so it says nothing about it.
+    async recentFiles(root, name, minutes) {
+      const base = ["-H", root, "-type", "f", "-name", name, "-mmin", `-${Math.ceil(minutes)}`];
+      const mac = () => run("find", [...base, "-exec", "stat", "-f", "%Fm %N", "{}", "+"], 10_000);
+      const gnu = () => run("find", [...base, "-printf", "%T@ %p\\n"], 10_000);
+      const out = statForm === "gnu" ? await gnu() : ((await mac()) ?? (await gnu()));
+      return parseRecent(out);
     },
     // `whole` (the text starts at the file's beginning) needs the size before and after: a file
     // that grew past n in between was cut. Growing only after tail ran it wasn't, but counts as cut
