@@ -1,6 +1,8 @@
 {
   "layout:Herdr-Roundup": {
     "cmd-w": "roundup-tabs.close",
-    "cmd-shift-w": "roundup-tabs.close-pane"
+    "cmd-shift-w": "roundup-tabs.close-pane",
+    "ctrl-shift-w": "roundup-tabs.close",
+    "ctrl-shift-x": "roundup-tabs.close-pane"
   }
 }

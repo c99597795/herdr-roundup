@@ -47,6 +47,21 @@ herdr-app do layout.switch '{"name":"Herdr-Roundup"}'
 
 `sync.sh` copies the layout, the `roundup-*` mods and the themes (copies, not symlinks: Herdr App doesn't load a mod's own SVGs through a symlink), and replaces only the `layout:Herdr-Roundup` section of your `keys.json`. Sizes, hidden columns and theme picks you change by clicking stay in `layouts/.state/`.
 
+### Windows
+
+This fork adds `scripts/sync.ps1`, the PowerShell counterpart of `sync.sh` (no `rsync`, `jq` or `sh` needed):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\sync.ps1
+herdr-app do layout.switch '{"name":"Herdr-Roundup"}'
+```
+
+Windows changes against upstream:
+
+- `keys.json` also binds `ctrl-shift-w` (close tab) and `ctrl-shift-x` (close pane), since there is no `cmd` key.
+- `roundup-tabs` shows the Files and Changes buttons when `workspace.panels` is empty (the welcome screen stores `[]` when nothing was ticked), instead of hiding both.
+- Not ported: the context meter in the pane header. It needs `ps`, `lsof`, `kill -0`, `tail` and a matching pid for Claude's status line, which Git Bash on Windows cannot give. The pane shows no meter there; nothing else is affected.
+
 ## Agent integrations
 
 The pane header shows how full each agent's context window is and, for Claude Code and Codex on a subscription, where the 5-hour and the weekly limit stand. Installing the layout switches on none of the integrations behind the exact numbers: each one changes your agent's own setup, so each one is yours to switch on, per agent, from a clone of this repo:
